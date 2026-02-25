@@ -1,0 +1,24 @@
+# --- PDI-Eval 最终忽略规则 ---
+
+# 1. 模型权重
+checkpoints/
+*.pth
+*.pt
+
+# 2. 数据与结果
+output/
+debug_results/
+results/
+*.mp4
+*.jpg
+*.png
+*.npz
+*.npy
+
+# 3. 系统与环境
+__pycache__/
+.vscode/
+.cursor/
+.DS_Store
+.venv/
+env/

@@ -1,0 +1,19 @@
+# 模型路径
+sam_ckpt: "checkpoints/sam2/sam2_hiera_large.pt"
+sam_cfg: "checkpoints/sam2/sam2_hiera_l.yaml"
+tracker_ckpt: "checkpoints/tracker/scaled_offline.pth"
+# Mega-SAM 内部权重已硬编码在 third_party/mega_sam/ 内部
+# 不需要在此处指定 mega_sam_ckpt，Wrapper 会自动寻找 internal paths
+
+engine_3d: "mega_sam"
+
+# PDI 评估权重 (w1: 尺度, w2: 轨迹, w3: 3D体积)
+weights:
+  w_scale: 0.4
+  w_trajectory: 0.4
+  w_volume: 0.2
+
+# 推理设置
+device: "cuda"
+sampling_rate: 1 # 每隔几帧处理一次 (1代表逐帧)
+save_cache: True
