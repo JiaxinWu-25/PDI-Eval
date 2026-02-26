@@ -66,14 +66,15 @@ class MegaSamWrapper(BasePerceptor):
     def _depth_to_pointmaps(depths, cam_c2w, fx, fy, cx, cy):
         """核心：生成世界坐标系点图 (供 volume_audit 进行 3D 测量)"""
         T, h, w = depths.shape
-        j, i = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+        # row_idx: (h, w) 行方向递增 = y 方向; col_idx: (h, w) 列方向递增 = x 方向
+        row_idx, col_idx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
         pointmaps = np.zeros((T, h, w, 3), dtype=np.float32)
         
         for t in range(T):
             d = depths[t].astype(np.float32)
             # 1. 反投影到相机坐标系 (Camera Space)
-            x_cam = (i - cx) * d / fx
-            y_cam = (j - cy) * d / fy
+            x_cam = (col_idx - cx) * d / fx
+            y_cam = (row_idx - cy) * d / fy
             z_cam = d
             pts_cam = np.stack([x_cam, y_cam, z_cam], axis=-1).reshape(-1, 3)
             
@@ -120,14 +121,18 @@ class MegaSamWrapper(BasePerceptor):
             sys.executable, os.path.join(self.mega_sam_root, "Depth-Anything", "run_videos.py"),
             "--img-path", frames_dir, "--outdir", da_out_dir, "--encoder", "vitl", "--load-from", self.da_ckpt,
         ], cwd=self.mega_sam_root, env=env, capture_output=True, text=True)
-        if r1.returncode != 0: return self._fallback_result(video_path, masks)
+        if r1.returncode != 0:
+            pdi_logger.error(f"Depth-Anything 失败 (code {r1.returncode}):\n{r1.stderr[-2000:]}")
+            return self._fallback_result(video_path, masks)
 
         # 3. Step 2: UniDepth
         r2 = subprocess.run([
             sys.executable, os.path.join(self.mega_sam_root, "UniDepth", "scripts", "demo_mega-sam.py"),
             "--img-path", frames_dir, "--outdir", metric_depth_base, "--scene-name", video_id,
         ], cwd=self.mega_sam_root, env=env, capture_output=True, text=True)
-        if r2.returncode != 0: return self._fallback_result(video_path, masks)
+        if r2.returncode != 0:
+            pdi_logger.error(f"UniDepth 失败 (code {r2.returncode}):\n{r2.stderr[-2000:]}")
+            return self._fallback_result(video_path, masks)
 
         # 4. Step 3: Droid Tracking
         r3 = subprocess.run([
@@ -136,7 +141,9 @@ class MegaSamWrapper(BasePerceptor):
             "--metric_depth_path", metric_depth_base, "--scene_name", video_id,
             "--weights", self.megasam_weights, "--disable_vis",
         ], cwd=self.mega_sam_root, env=env, capture_output=True, text=True)
-        if r3.returncode != 0: return self._fallback_result(video_path, masks)
+        if r3.returncode != 0:
+            pdi_logger.error(f"Droid Tracking 失败 (code {r3.returncode}):\n{r3.stderr[-2000:]}")
+            return self._fallback_result(video_path, masks)
 
         # 5. 解析结果与升维
         npz_path = os.path.join(self.mega_sam_root, "outputs", f"{video_id}_droid.npz")
@@ -193,6 +200,6 @@ class MegaSamWrapper(BasePerceptor):
             depth_z=np.ones(T),
             focal_length=1000.0,
             camera_poses=np.eye(4)[None].repeat(T, axis=0),
-            pointmaps=np.zeros((T, 480, 640, 3)),
+            pointmaps=np.zeros((T, masks.shape[1], masks.shape[2], 3)),
             metadata={"engine": "Mega-SAM-Fallback"}
         )

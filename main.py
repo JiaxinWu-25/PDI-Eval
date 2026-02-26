@@ -16,7 +16,8 @@ def main():
     parser.add_argument("--input", type=str, required=True, help="视频文件路径")
     parser.add_argument("--config", type=str, default="configs/default.yaml")
     parser.add_argument("--output_dir", type=str, default="results")
-    parser.add_argument("--points", type=str, default="[[500,500]]", help="SAM2 初始点击点坐标")
+    parser.add_argument("--points", type=str, default=None, help="SAM2 初始点击点坐标，如 [[500,500]]")
+    parser.add_argument("--text", type=str, default=None, help="目标物体文字描述，如 'train'、'car'，用于 Florence-2 自动定位")
     args = parser.parse_args()
 
     # 1. 验证配置文件
@@ -33,15 +34,20 @@ def main():
     
     # 3. 运行审计
     pdi_logger.info(f"🚀 开始审计视频: {args.input}")
-    try:
-        # 安全解析坐标点
-        click_points = eval(args.points)
-    except Exception as e:
-        pdi_logger.error(f"Invalid points format: {args.points}. Error: {e}")
+    if args.points is None and args.text is None:
+        pdi_logger.error("错误：必须提供 --points 或 --text 其中的一个")
         return
 
+    click_points = None
+    if args.points is not None:
+        try:
+            click_points = eval(args.points)
+        except Exception as e:
+            pdi_logger.error(f"Invalid points format: {args.points}. Error: {e}")
+            return
+
     # 获取执行结果
-    report = pipeline.run(video_path=args.input, click_points=click_points)
+    report = pipeline.run(video_path=args.input, click_points=click_points, text_query=args.text)
 
     # 4. 生成可视化物证
     video_stem = Path(args.input).stem
@@ -74,7 +80,8 @@ def main():
         f.write("        PDI-Eval Final Audit Report\n")
         f.write("="*50 + "\n")
         f.write(f"Video Source:  {args.input}\n")
-        f.write(f"Target Points: {args.points}\n")
+        target_desc = f"text='{args.text}'" if args.text else f"points={args.points}"
+        f.write(f"Target: {target_desc}\n")
         f.write("-" * 50 + "\n")
         f.write(f"FINAL PDI SCORE: {report['pdi_score']:.4f}\n")
         f.write(f"OVERALL GRADE:   {report['grade']}\n")

@@ -69,24 +69,42 @@ class TrackWrapper(BasePerceptor):
         video_tensor = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None] # (1, T, 3, H, W)
         video_tensor = video_tensor.to(self.device) 
 
-        # --- 关键修复 1: 调整 Mask 维度并修改参数名为 segm_mask ---
-        # 缩放初始 Mask
+        # 缩放初始 Mask，并保证前景=1（Co-Tracker 要求非零为前景）
         small_mask = cv2.resize(initial_mask.astype(np.uint8), (curr_w, curr_h), interpolation=cv2.INTER_NEAREST)
-        # 维度变换: (H, W) -> (1, 1, H, W)
-        mask_tensor = torch.from_numpy(small_mask).to(self.device).unsqueeze(0).unsqueeze(0).float()
-        
+        small_mask = (small_mask > 0).astype(np.uint8)
+
+        # 从 mask 内均匀采样点作为 queries，避免 grid+segm_mask 导致 0 点（网格带 margin 且目标小时会筛掉所有点）
+        yy, xx = np.where(small_mask > 0)
+        if len(yy) == 0:
+            pdi_logger.warning("初始 mask 无前景像素，改用全图网格追踪")
+            queries = None
+        else:
+            n_pts = min(grid_size * grid_size, len(yy))
+            idx = np.linspace(0, len(yy) - 1, n_pts, dtype=int)
+            qx = xx[idx].astype(np.float32)
+            qy = yy[idx].astype(np.float32)
+            # (t, x, y)，与 CoTracker 的 queries 格式一致；t=0 表示从第 0 帧开始追
+            queries_np = np.stack([np.zeros(n_pts), qx, qy], axis=1).astype(np.float32)
+            queries = torch.from_numpy(queries_np[None]).to(self.device)
+
         pdi_logger.info(f"Co-Tracker 正在执行全视频追踪 (优化后尺寸: {curr_w}x{curr_h})...")
         
-        # 3. 执行推理
+        # 3. 执行推理：有 mask 内采样点则用 queries，否则用 grid
         with torch.no_grad():
-            with torch.cuda.amp.autocast(): 
-                # --- 关键修复 2: 使用 segm_mask 代替 mask ---
-                tracks, visibility = self.model(
-                    video_tensor.float(), 
-                    grid_size=grid_size, 
-                    grid_query_frame=0,
-                    segm_mask=mask_tensor  # <--- 修改这里
-                )
+            with torch.cuda.amp.autocast():
+                if queries is not None:
+                    tracks, visibility = self.model(
+                        video_tensor.float(),
+                        queries=queries,
+                        grid_size=0,
+                        grid_query_frame=0,
+                    )
+                else:
+                    tracks, visibility = self.model(
+                        video_tensor.float(),
+                        grid_size=grid_size,
+                        grid_query_frame=0,
+                    )
         
         # 4. 坐标还原
         tracks_np = tracks[0].cpu().numpy() 

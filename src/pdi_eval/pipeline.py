@@ -26,7 +26,7 @@ class PDIEvaluationPipeline:
         self.last_report = None
         self.last_res_tracks = None
 
-    def run(self, video_path: str, click_points: Optional[list] = None) -> Dict[str, Any]:
+    def run(self, video_path: str, click_points: Optional[list] = None, text_query: Optional[str] = None) -> Dict[str, Any]:
         self.video_path = video_path
         self.video_id = Path(video_path).stem
         pdi_logger.info(f"--- [bold blue]PDI-Eval Pipeline Start: {self.video_id}[/bold blue] ---")
@@ -37,7 +37,7 @@ class PDIEvaluationPipeline:
             res_2d = self.cache.load_step(self.video_id, "sam2")
         else:
             sam = Sam2Wrapper(checkpoint=self.config['sam_ckpt'], config=self.config.get('sam_cfg'))
-            res_2d_raw = sam.infer(video_path, click_points=click_points)
+            res_2d_raw = sam.infer(video_path, click_points=click_points, text_query=text_query)
             self.cache.save_step(self.video_id, "sam2", {
                 "masks": res_2d_raw.masks,
                 "h_pixel": res_2d_raw.h_pixel,
