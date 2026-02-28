@@ -7,11 +7,16 @@ tracker_ckpt: "checkpoints/tracker/scaled_offline.pth"
 
 engine_3d: "mega_sam"
 
-# PDI 评估权重 (w1: 尺度, w2: 轨迹, w3: 3D体积)
+# PDI v2.0 评估权重
+# w_scale:      epsilon_scale      — 缩放节奏是否符合 h·Z 守恒
+# w_trajectory: epsilon_trajectory — 运动路径是否收敛到正确消失点
+# w_rigidity:     sigma(rigidity)    — 物体 3D 刚性是否稳定
+# w_vp:         epsilon_vp         — 前景与场景是否共用同一透视空间（视角耦合）
 weights:
-  w_scale: 0.4
-  w_trajectory: 0.4
-  w_volume: 0.2
+  w_scale: 0.3
+  w_trajectory: 0.2
+  w_rigidity: 0.2
+  w_vp: 0.3
 
 # 推理设置
 device: "cuda"

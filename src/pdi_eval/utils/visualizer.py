@@ -108,6 +108,28 @@ class EvidenceVisualizer:
             sbs_frames.append(frame_sbs)
         return np.stack(sbs_frames)
 
+    def save_mask_sample(self, masks: np.ndarray, video_frames: np.ndarray, video_id: str) -> str:
+        """随机抽一帧，将 SAM2 mask 叠加到原始帧上保存为单张 PNG。
+
+        Returns:
+            保存文件路径
+        """
+        T = masks.shape[0]
+        i = int(np.random.randint(0, T))
+        mask = (masks[i] > 0).astype(np.uint8)
+        if video_frames is not None and i < len(video_frames):
+            overlay = video_frames[i].copy()
+            overlay[mask == 1] = (overlay[mask == 1] * 0.4 + np.array([0, 255, 0]) * 0.6).clip(0, 255).astype(np.uint8)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)
+            out = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        else:
+            out = mask * 255
+        os.makedirs(self.output_dir, exist_ok=True)
+        save_path = os.path.join(self.output_dir, f"{video_id}_mask_frame{i:04d}.png")
+        cv2.imwrite(save_path, out)
+        return save_path
+
     def save_video(self, frames: np.ndarray, filename: str, fps: float = 25.0) -> str:
         """
         将标注帧序列写入 MP4。处理编码器不可用、目录缺失、帧数不一致等问题。

@@ -137,6 +137,8 @@ class Sam2Wrapper(BasePerceptor):
             cap = cv2.VideoCapture(video_path)
             ret, frame = cap.read()
             cap.release()
+            if not ret or frame is None or frame.size == 0:
+                raise ValueError(f"无法读取视频首帧: {video_path}，请检查文件是否损坏或格式是否支持")
             temp_frame_path = "output/temp/first_frame_detect.jpg"
             os.makedirs("output/temp", exist_ok=True)
             cv2.imwrite(temp_frame_path, frame)

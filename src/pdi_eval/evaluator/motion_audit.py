@@ -1,48 +1,54 @@
 import numpy as np
-from typing import List, Union
+from typing import Tuple
 
-def audit_trajectory_consistency(h_seq: np.ndarray, x_seq: np.ndarray, cx: float) -> float:
-    """轨迹审计员：检测物体位移与缩放的空间耦合性 (H-X 齐次性)
-    
-    原理：ε = |(h1/hi) - (x1-cx)/(xi-cx)|
-    捕捉幻觉：滑步（Skating）、地平面漂移。
-    
+
+def audit_trajectory_consistency(
+    h_seq: np.ndarray,
+    xy_seq: np.ndarray,
+    vanishing_point: Tuple[float, float],
+) -> np.ndarray:
+    """广义透视轨迹审计（横向运动自适应版）
+
+    两种场景自动切换：
+    - 纵向/斜向运动：Log(H-VP 齐次性)残差，log(h1/ht) vs log(d1/dt)
+    - 横向平移（VP 在无穷远）：高度稳定性残差，|h(t) - h(0)| / h(0)
+
+    判断依据：VP 距离序列的极差比 < 5% 视为横向运动。
+
     Args:
-        h_seq: 像素高度序列 (T,)
-        x_seq: 像素横坐标序列 (物体质心) (T,)
-        cx: 画面中心 (Principal Point)，通常为 W/2.0
-        
+        h_seq:           (T,) SAM2 像素高度序列
+        xy_seq:          (T, 2) Co-Tracker 质心坐标序列
+        vanishing_point: (vx, vy)
+
     Returns:
-        rmse_trajectory: 轨迹残差的均方根误差 (RMSE)
+        (T-1,) 轨迹残差序列
     """
-    if len(h_seq) < 2:
-        return 0.0
-        
-    errors = []
-    
-    # 1. 提取首帧基准值 (使用前 5 帧均值增加稳定性)
-    h1 = np.mean(h_seq[:5]) if len(h_seq) >= 5 else (h_seq[0] if h_seq[0] != 0 else 1.0)
-    x1_rel = x_seq[0] - cx # 第一帧相对于中心点的位移
-    
-    # 2. 遍历序列校验
-    for t in range(1, len(h_seq)):
-        # 1. 尺度收敛比：物体变小了多少倍 (hi 最小设为 1.0 像素)
-        hi = max(h_seq[t], 1.0)
-        s_ratio = h1 / hi
-        
-        # 2. 横向位置收敛比：相对于消失点中心 cx 的收敛情况
-        xi_rel = x_seq[t] - cx
-        
-        # 3. 滑步判定 (Skating Logic)
-        # 如果初始位置离中心有一定距离且当前位置不在中心点
-        if np.abs(x1_rel) > 5.0 and np.abs(xi_rel) > 1e-3:
-            pos_ratio = x1_rel / xi_rel
-            # ε_trajectory = |s_ratio - pos_ratio|
-            epsilon_traj = np.abs(s_ratio - pos_ratio)
-        else:
-            # 物体初始位置就在中心附近，或已收敛至中心，不计入滑步残差
-            epsilon_traj = 0.0
-            
-        errors.append(epsilon_traj)
-        
-    return np.array(errors) if errors else np.zeros(1)
+    T = len(h_seq)
+    if T < 2:
+        return np.zeros(1)
+
+    vp = np.array(vanishing_point, dtype=np.float64)
+    dist = np.linalg.norm(xy_seq.astype(np.float64) - vp, axis=1)  # (T,)
+
+    dist_range_ratio = float(np.ptp(dist)) / (float(np.mean(dist)) + 1e-6)
+
+    if dist_range_ratio < 0.05:
+        # 横向平移场景：深度基本不变，h 也不应变
+        h0 = max(float(h_seq[0]), 1e-6)
+        errors = np.abs(h_seq[1:] - h0) / h0
+        return errors
+
+    # 纵向/斜向场景：Log 空间 H-VP 齐次性
+    log_h = np.log(np.maximum(h_seq, 1e-6))
+    log_d = np.log(np.maximum(dist, 1e-6))
+
+    # 用前 5 帧中值作为基准，抑制初始帧噪声
+    n_ref = min(5, T)
+    h_base = float(np.median(log_h[:n_ref]))
+    d_base = float(np.median(log_d[:n_ref]))
+
+    log_h_ratio = log_h - h_base
+    log_d_ratio = log_d - d_base
+
+    errors = np.abs(log_h_ratio - log_d_ratio)
+    return errors[1:]

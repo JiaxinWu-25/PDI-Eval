@@ -47,6 +47,7 @@ class MegaSamWrapper(BasePerceptor):
             self.mega_sam_root, "Depth-Anything", "checkpoints", "depth_anything_vitl14.pth"
         )
         self.megasam_weights = os.path.join(self.mega_sam_root, "checkpoints", "megasam_final.pth")
+        self.raft_weights = os.path.join(self.mega_sam_root, "cvd_opt", "raft-things.pth")
 
     @staticmethod
     def _parse_intrinsic(K) -> tuple:
@@ -91,6 +92,8 @@ class MegaSamWrapper(BasePerceptor):
             self.mega_sam_root,
             os.path.join(self.mega_sam_root, "Depth-Anything"),
             os.path.join(self.mega_sam_root, "UniDepth"),
+            os.path.join(self.mega_sam_root, "cvd_opt"),
+            os.path.join(self.mega_sam_root, "cvd_opt", "core"),
         ]
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(parts) + os.pathsep + env.get("PYTHONPATH", "")
@@ -134,7 +137,7 @@ class MegaSamWrapper(BasePerceptor):
             pdi_logger.error(f"UniDepth 失败 (code {r2.returncode}):\n{r2.stderr[-2000:]}")
             return self._fallback_result(video_path, masks)
 
-        # 4. Step 3: Droid Tracking
+        # 3. Step 3: Droid Tracking (camera_tracking)
         r3 = subprocess.run([
             sys.executable, os.path.join(self.mega_sam_root, "camera_tracking_scripts", "test_demo.py"),
             "--datapath", frames_dir, "--mono_depth_path", mono_depth_base,
@@ -145,8 +148,41 @@ class MegaSamWrapper(BasePerceptor):
             pdi_logger.error(f"Droid Tracking 失败 (code {r3.returncode}):\n{r3.stderr[-2000:]}")
             return self._fallback_result(video_path, masks)
 
-        # 5. 解析结果与升维
-        npz_path = os.path.join(self.mega_sam_root, "outputs", f"{video_id}_droid.npz")
+        # 4. Step 4a: RAFT 光流预处理（CVD 前置）
+        cvd_npz_path = os.path.join(self.mega_sam_root, "outputs_cvd", f"{video_id}_sgd_cvd_hr.npz")
+        use_cvd = False
+        if os.path.exists(self.raft_weights):
+            r4 = subprocess.run([
+                sys.executable, os.path.join(self.mega_sam_root, "cvd_opt", "preprocess_flow.py"),
+                "--datapath", frames_dir,
+                "--model", self.raft_weights,
+                "--scene_name", video_id,
+                "--mixed_precision",
+            ], cwd=self.mega_sam_root, env=env, capture_output=True, text=True)
+            if r4.returncode != 0:
+                pdi_logger.warning(f"RAFT Flow 失败，跳过 CVD 优化:\n{r4.stderr[-1000:]}")
+            else:
+                # 4. Step 4b: CVD 一致性深度优化
+                r5 = subprocess.run([
+                    sys.executable, os.path.join(self.mega_sam_root, "cvd_opt", "cvd_opt.py"),
+                    "--scene_name", video_id,
+                    "--output_dir", "outputs_cvd",
+                    "--w_grad", "2.0",
+                    "--w_normal", "5.0",
+                ], cwd=self.mega_sam_root, env=env, capture_output=True, text=True)
+                if r5.returncode != 0:
+                    pdi_logger.warning(f"CVD Opt 失败，回退到 DROID 原始输出:\n{r5.stderr[-1000:]}")
+                elif os.path.exists(cvd_npz_path):
+                    use_cvd = True
+                    pdi_logger.info("CVD 深度优化完成，使用时序一致性深度")
+        else:
+            pdi_logger.warning(
+                f"RAFT 权重不存在 ({self.raft_weights})，跳过 CVD 优化。"
+                "请在 third_party/mega_sam/cvd_opt/ 下运行: gdown 1R8m_jMvCun-N45XkMvHlG0P38kXy-h6I"
+            )
+
+        # 6. 解析结果与升维
+        npz_path = cvd_npz_path if use_cvd else os.path.join(self.mega_sam_root, "outputs", f"{video_id}_droid.npz")
         if not os.path.exists(npz_path): return self._fallback_result(video_path, masks)
 
         data = np.load(npz_path, allow_pickle=True)

@@ -4,17 +4,24 @@
 
 ---
 
-## 核心架构
+## 核心评测逻辑
 
-- **perception/**: 提取场景深度、轨迹和分割掩码。
-- **geometry/**: 处理齐次坐标投影与相机内外参变换。
-- **evaluator/**: 核心审计逻辑，包括尺度校验、轨迹校验与 3D 体积稳定性校验。
+PDI v2.0 指标由四个审计维度组成：
+
+| 维度 | 原理 | 捕捉的幻觉类型 |
+| :--- | :--- | :--- |
+| **$\epsilon_{scale}$**（尺度-深度守恒） | $\log(h) + \log(Z) = \text{Const}$，对齐前几帧的 log(hZ) 中值，使用 Log 空间确保「放大 / 缩小」误差对称 | 比例幻觉（物体变小节奏与深度不符） |
+| **$\epsilon_{trajectory}$**（VP-Driven 轨迹） | 纵/斜向运动：$h_1/h_t \approx \text{Dist}(p_1, VP)/\text{Dist}(p_t, VP)$；横向平移（VP 在无穷远）时自动退化为高度稳定性残差 | 滑步幻觉（横向运动自适应切换） |
+| **$\sigma(R_{rigidity})$**（体积/刚性稳定性） | 优先使用 3D pointmap 计算物体 3D 身高序列的变异系数；若 3D 失效则退化为点对距离比值协同度（刚性稳定性） | 果冻效应、体积呼吸感 |
+| **$\epsilon_{vp}$**（视角耦合一致性） | 归一化的前景 VP 与背景 VP 之间的欧氏距离：$\epsilon_{vp} = \frac{\|\text{VP}_{fg} - \text{VP}_{bg}\|_2}{\text{Diag}(\text{Image})}$，背景线不足时自动降权为 0 | 物体与场景不在同一透视空间（前景/背景「不同镜头」感） |
+
+$$PDI = w_1 \cdot \text{RMSE}(\epsilon_{scale}) + w_2 \cdot \text{RMSE}(\epsilon_{trajectory}) + w_3 \cdot \sigma(R_{rigidity}) + w_4 \cdot \epsilon_{vp}$$
 
 ---
 
 ## 1. 环境要求
 
-本项目对 CUDA 版本极其敏感。为确保 Mega-SAM 底层 C++/CUDA 算子能够成功编译，**必须严格遵守以下版本配比**：
+本项目对 CUDA 版本极其敏感。**必须严格遵守以下版本配比**：
 
 - **Python**: 3.10
 - **CUDA Toolkit**: 11.8
@@ -33,10 +40,10 @@ conda activate pdi_eval
 # 安装基础编译工具
 conda install -c conda-forge gxx_linux-64=11 gcc_linux-64=11 cmake -y
 
-# 安装匹配 CUDA 11.8 的 PyTorch（严禁直接 pip install torch，必须指定 index-url）
+# 安装 PyTorch（必须指定 index-url）
 pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
 
-# 安装 CUDA 编译器，确保编译时 nvcc 版本对齐
+# 安装 CUDA 编译器，确保 nvcc 版本与 cu118 对齐
 conda install -c nvidia cuda-toolkit=11.8 -y
 ```
 
@@ -54,12 +61,58 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 ## 3. 克隆项目与子模块
 
+本项目包含嵌套子模块：`third_party/mega_sam` 本身还依赖 `third_party/mega_sam/base`（DROID-SLAM 核心）。
+
 ```bash
-git clone --recursive https://github.com/your_username/PDI-Eval.git
+git clone --recursive https://github.com/JiaxinWu-25/PDI-Eval.git
 cd PDI-Eval
 
-# 若已克隆主仓库，请初始化子模块
+# 若已克隆主仓库，初始化所有层级的子模块（含嵌套）
 git submodule update --init --recursive
+```
+
+### 3.1 应用 PyTorch 2.1 兼容性补丁
+
+`mega_sam/base` 中的 `projective_ops.py` 使用了 lietorch Lie 群运算，在 PyTorch 2.1 下会因 `AutocastCUDA` dispatch key 不被识别而崩溃，需手动打补丁：
+
+```bash
+cd third_party/mega_sam/base/droid_slam/geom
+
+python - <<'EOF'
+import pathlib
+
+f = pathlib.Path('projective_ops.py')
+src = f.read_text()
+
+old1 = (
+    "  # transform\n"
+    "  Gij = poses[:, jj] * poses[:, ii].inv()\n"
+    "\n"
+    "  ## WHAT HACK IS THIS LINE?\n"
+    "  ## I think it's for stereo rig!\n"
+    "  # Gij.data[:,ii==jj] = torch.as_tensor([-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=\"cuda\")\n"
+    "  X1, Ja = actp(Gij, X0, jacobian=jacobian)"
+)
+new1 = (
+    "  # transform - lietorch Lie group ops do not support AutocastCUDA dispatch key\n"
+    "  with torch.cuda.amp.autocast(enabled=False):\n"
+    "    Gij = poses[:, jj] * poses[:, ii].inv()\n"
+    "    X1, Ja = actp(Gij, X0, jacobian=jacobian)\n"
+    "\n"
+    "  ## WHAT HACK IS THIS LINE?\n"
+    "  ## I think it's for stereo rig!\n"
+    "  # Gij.data[:,ii==jj] = torch.as_tensor([-0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], device=\"cuda\")"
+)
+
+if old1 in src:
+    src = src.replace(old1, new1)
+    f.write_text(src)
+    print("patch applied to projective_transform")
+else:
+    print("projective_transform: already patched or source changed, skipping")
+EOF
+
+cd ../../../../
 ```
 
 ---
@@ -94,25 +147,29 @@ python -c "from torch_scatter import scatter_sum; print('torch_scatter OK')"
 
 ### 4.4 编译 Mega-SAM 底层算子
 
-由于 `base/setup.py` 包含双重调用问题，必须手动拆分安装：
+Mega-SAM 的 DROID-SLAM 核心依赖两个 CUDA C++ 扩展：`droid_backends` 和 `lietorch`。编译产物必须与当前 PyTorch 版本完全匹配，否则会出现 `undefined symbol` 或 `Unrecognized tensor type ID: AutocastCUDA` 错误。
 
 ```bash
 cd third_party/mega_sam/base
 
-# 1. 编译并安装 droid_backends
+# 步骤 1：编译并安装 droid_backends
 cp setup_droid.py setup.py
 pip install -e . --no-build-isolation
 
-# 2. 将编译好的 droid_backends.so 复制到 site-packages（关键步骤，不可跳过）
-#    编译完成后 .so 文件在当前目录，但 Python 运行时会从 site-packages 加载
+# 步骤 2：将编译好的 droid_backends.so 复制到 site-packages
+#         Python 运行时默认从 site-packages 加载，若不复制则加载旧版会导致 ABI 错误
 SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
 cp droid_backends*.so "$SITE_PKG/"
 
-# 3. 编译并安装 lietorch
+# 步骤 3：编译并安装 lietorch
 cp setup_lie.py setup.py
 pip install -e . --no-build-isolation
 
-# 4. 还原 setup.py
+# 步骤 4：将编译好的 lietorch_backends.so 也复制到 site-packages
+#         同样原因：旧版 .so 缺少 AutocastCUDA dispatch key 注册，在 PyTorch 2.1 下必然崩溃
+cp thirdparty/lietorch/lietorch_backends*.so "$SITE_PKG/"
+
+# 步骤 5：还原 setup.py
 cp setup_org.py setup.py
 
 cd ../../../
@@ -121,6 +178,7 @@ cd ../../../
 验证安装：
 ```bash
 python -c "import droid_backends; print('droid_backends OK')"
+python -c "from lietorch import SE3; p = SE3.Identity(1, device='cuda'); p.inv(); print('lietorch OK')"
 ```
 
 > **说明**：编译过程中出现大量 `-Wdeprecated-declarations`、`-Wreorder` 等警告是正常现象，不影响使用。只有出现 `error:` 才需要处理。
@@ -134,8 +192,6 @@ python -c "import droid_backends; print('droid_backends OK')"
 ### SAM2
 ```bash
 mkdir -p checkpoints/sam2
-# 下载 sam2_hiera_large.pt 和 sam2_hiera_l.yaml
-# 官方地址：https://github.com/facebookresearch/segment-anything-2
 wget -P checkpoints/sam2 https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt
 ```
 
@@ -160,7 +216,10 @@ mkdir -p third_party/mega_sam/checkpoints
 # 从 Mega-SAM 官方仓库获取：https://github.com/mega-sam/mega-sam
 ```
 
-### Mega-SAM: RAFT (用于 CVD 优化)
+### Mega-SAM: RAFT (用于 CVD 一致性深度优化，必须下载)
+
+> RAFT 是 MegaSAM 全流程的第 4 步（CVD 前置光流）所需权重。若缺失，Pipeline 会自动回退到 DROID 原始深度，但深度时序一致性会下降。
+
 ```bash
 pip install gdown
 cd third_party/mega_sam/cvd_opt/
@@ -210,6 +269,12 @@ python sam2_check.py --input data/your_video.mp4 --text "train" --output mask_ch
 python cotracker_check.py --input data/your_video.mp4 --text "train" --output cotracker_check.mp4
 ```
 
+验证 Mega-SAM 3D 重建输出（输出在 `output/cache/<视频名>_mega_sam.npz`）：
+
+```bash
+python test.py
+```
+
 ---
 
 ## 8. 输出说明
@@ -217,9 +282,9 @@ python cotracker_check.py --input data/your_video.mp4 --text "train" --output co
 运行完成后，结果保存在 `results/<视频名>/` 目录下：
 
 - `*_pdi_report.txt` — 文字报告，包含 PDI 分数和各维度明细
-- `*_scale_traj_errors.png` — 尺度与轨迹残差曲线图
-- `*_volume_stability.png` — 3D 体积稳定性折线图
-- `*_annotated.mp4` — 叠加了透视线和追踪点的标注视频
+- `*_scale_traj_errors.png` — 尺度与轨迹残差曲线图（Log 空间）
+- `*_volume_stability.png` — 刚性稳定性折线图
+- `*_annotated.mp4` — 叠加了消失点、透视线和追踪点的标注视频
 
 ---
 
@@ -232,19 +297,20 @@ PDI-Eval/
 │   └── default.yaml
 ├── data/                     # 测试视频
 ├── third_party/              # Git 子模块
-│   └── mega_sam/             # Mega-SAM 仓库
+│   └── mega_sam/             # Mega-SAM 仓库（含 base/ DROID-SLAM）
 ├── src/
 │   └── pdi_eval/
 │       ├── pipeline.py       # 总控：管理模型加载与数据流转
 │       ├── perception/       # 感知层：SAM2 / CoTracker / MegaSAM 封装
-│       ├── geometry/         # 相机投影与坐标变换
-│       ├── evaluator/        # 审计逻辑：尺度、轨迹、体积
+│       ├── geometry/         # 相机投影、消失点估算
+│       ├── evaluator/        # 审计逻辑：尺度、VP-Driven 轨迹、刚性
 │       ├── metrics/          # PDI 指标合成
 │       ├── data/             # 缓存管理
 │       └── utils/            # 日志与可视化
 ├── main.py                   # 命令行入口
 ├── sam2_check.py             # SAM2 调试脚本
 ├── cotracker_check.py        # Co-Tracker 调试脚本
+├── test.py                   # Mega-SAM 输出验证脚本
 ├── requirements.txt
 └── README.md
 ```
@@ -262,7 +328,34 @@ PDI-Eval/
 
 ---
 
-## 11. 引用
+## 11. 常见问题
+
+### `Unrecognized tensor type ID: AutocastCUDA`
+
+`lietorch_backends.so` 未正确更新为当前 PyTorch 2.1 编译版本。执行：
+```bash
+SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
+cp third_party/mega_sam/base/thirdparty/lietorch/lietorch_backends*.so "$SITE_PKG/"
+```
+
+### `undefined symbol: _ZNK3c106SymIntneEl`（droid_backends）
+
+`droid_backends.so` 未正确更新。执行：
+```bash
+SITE_PKG=$(python -c "import site; print(site.getsitepackages()[0])")
+cp third_party/mega_sam/base/droid_backends*.so "$SITE_PKG/"
+```
+
+### `torch_scatter/_scatter_cuda.so: undefined symbol`
+
+`torch-scatter` 版本与 PyTorch 2.1 不匹配。执行：
+```bash
+pip install torch-scatter --force-reinstall -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+```
+
+---
+
+## 12. 引用
 
 如果您在研究中使用了本项目，请引用：
 
@@ -384,3 +477,32 @@ SAM2。
 *   **全自动语义逻辑** 保证了：只要输入 "train"，系统每次都
 会以同样的方式锁定物体中心，你的 PDI 评估结果才是**客观、可
 复现、具备学术公信力**的。
+
+
+### 生成mega-sam.npz时同时生成几个图片（视图不一样），接入豆包等api让它们帮忙判断是否重建成功
+
+### 适用场景，可能与mega-sam
+拿它们的example视频！！！
+
+### 还不太稳定
+
+### 实验部分
+四个场景（每个场景4个video，每个video对各个指标测一遍(选好后核对一下，直接更新在overleaf)
+prompt
+
+开源ai-闭源ai-真实视频
+
+CogvideoX
+wan2.2
+hunyuan
+
+seedance2.0
+kling(快手)
+
+sora
+nanobanana
+
+闭源就调用api
+
+真实视频（mega-sam的数据集）
+

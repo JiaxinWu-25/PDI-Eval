@@ -42,17 +42,30 @@ class TrackWrapper(BasePerceptor):
             pdi_logger.info("正在自动切换至 torch.hub 下载匹配模型...")
             return torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(self.device)
 
-    def infer(self, video_path: str, initial_mask: np.ndarray, grid_size: int = 10, **kwargs) -> PerceptionResult:
+    def infer(
+        self,
+        video_path: str,
+        initial_mask: np.ndarray,
+        grid_size: int = 10,
+        bg_grid_size: int = 15,
+        **kwargs,
+    ) -> PerceptionResult:
+        """前景+背景一次性追踪。
+
+        背景点通过在 mask 外区域均匀采样获得，与前景点合并后送入同一次
+        Co-Tracker 推理，推理结束后再按 n_fg 拆分，避免重复加载模型。
+        bg_tracks 存入 metadata['bg_tracks'] / metadata['bg_visibility']。
+        """
         import cv2
-        
+
         # 1. 读取视频并进行空间缩放
         cap = cv2.VideoCapture(video_path)
         frames = []
-        max_dim = 880 
-        
+        max_dim = 880
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                break
             h, w = frame.shape[:2]
             if max(h, w) > max_dim:
                 scale = max_dim / max(h, w)
@@ -60,72 +73,105 @@ class TrackWrapper(BasePerceptor):
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(frame)
         cap.release()
-        
+
         orig_h, orig_w = initial_mask.shape
         curr_h, curr_w = frames[0].shape[:2]
         scale_x, scale_y = orig_w / curr_w, orig_h / curr_h
-        
-        video_np = np.stack(frames) 
-        video_tensor = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None] # (1, T, 3, H, W)
-        video_tensor = video_tensor.to(self.device) 
 
-        # 缩放初始 Mask，并保证前景=1（Co-Tracker 要求非零为前景）
-        small_mask = cv2.resize(initial_mask.astype(np.uint8), (curr_w, curr_h), interpolation=cv2.INTER_NEAREST)
+        video_np = np.stack(frames)
+        video_tensor = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None].to(self.device)
+
+        # 缩放 mask
+        small_mask = cv2.resize(
+            initial_mask.astype(np.uint8), (curr_w, curr_h),
+            interpolation=cv2.INTER_NEAREST,
+        )
         small_mask = (small_mask > 0).astype(np.uint8)
 
-        # 从 mask 内均匀采样点作为 queries，避免 grid+segm_mask 导致 0 点（网格带 margin 且目标小时会筛掉所有点）
-        yy, xx = np.where(small_mask > 0)
-        if len(yy) == 0:
-            pdi_logger.warning("初始 mask 无前景像素，改用全图网格追踪")
-            queries = None
+        # --- 2. 前景 queries ---
+        yy_fg, xx_fg = np.where(small_mask > 0)
+        if len(yy_fg) == 0:
+            pdi_logger.warning("初始 mask 无前景像素，仅使用背景网格追踪")
+            fg_queries_np = np.empty((0, 3), dtype=np.float32)
         else:
-            n_pts = min(grid_size * grid_size, len(yy))
-            idx = np.linspace(0, len(yy) - 1, n_pts, dtype=int)
-            qx = xx[idx].astype(np.float32)
-            qy = yy[idx].astype(np.float32)
-            # (t, x, y)，与 CoTracker 的 queries 格式一致；t=0 表示从第 0 帧开始追
-            queries_np = np.stack([np.zeros(n_pts), qx, qy], axis=1).astype(np.float32)
-            queries = torch.from_numpy(queries_np[None]).to(self.device)
+            n_fg = min(grid_size * grid_size, len(yy_fg))
+            idx_fg = np.linspace(0, len(yy_fg) - 1, n_fg, dtype=int)
+            fg_queries_np = np.stack(
+                [np.zeros(n_fg), xx_fg[idx_fg].astype(np.float32), yy_fg[idx_fg].astype(np.float32)],
+                axis=1,
+            )
 
-        pdi_logger.info(f"Co-Tracker 正在执行全视频追踪 (优化后尺寸: {curr_w}x{curr_h})...")
-        
-        # 3. 执行推理：有 mask 内采样点则用 queries，否则用 grid
-        with torch.no_grad():
-            with torch.cuda.amp.autocast():
-                if queries is not None:
+        # --- 3. 背景 queries ---
+        yy_bg, xx_bg = np.where(small_mask == 0)
+        if len(yy_bg) > 0:
+            n_bg = min(bg_grid_size * bg_grid_size, len(yy_bg))
+            idx_bg = np.linspace(0, len(yy_bg) - 1, n_bg, dtype=int)
+            bg_queries_np = np.stack(
+                [np.zeros(n_bg), xx_bg[idx_bg].astype(np.float32), yy_bg[idx_bg].astype(np.float32)],
+                axis=1,
+            )
+        else:
+            bg_queries_np = np.empty((0, 3), dtype=np.float32)
+
+        # --- 4. 合并 queries 送入推理 ---
+        n_fg_pts = len(fg_queries_np)
+        all_queries_np = np.vstack([fg_queries_np, bg_queries_np]).astype(np.float32)
+
+        pdi_logger.info(
+            f"Co-Tracker 追踪 (尺寸:{curr_w}x{curr_h}, "
+            f"前景:{n_fg_pts}点, 背景:{len(bg_queries_np)}点)..."
+        )
+
+        if len(all_queries_np) >= 2:
+            queries = torch.from_numpy(all_queries_np[None]).to(self.device)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast():
                     tracks, visibility = self.model(
                         video_tensor.float(),
                         queries=queries,
                         grid_size=0,
                         grid_query_frame=0,
                     )
-                else:
+        else:
+            # 兜底：全图网格
+            with torch.no_grad():
+                with torch.cuda.amp.autocast():
                     tracks, visibility = self.model(
                         video_tensor.float(),
                         grid_size=grid_size,
                         grid_query_frame=0,
                     )
-        
-        # 4. 坐标还原
-        tracks_np = tracks[0].cpu().numpy() 
+            n_fg_pts = tracks.shape[2]  # 全部算前景
+
+        # --- 5. 坐标还原 & 前背景拆分 ---
+        tracks_np = tracks[0].cpu().numpy()   # (T, N_total, 2)
         tracks_np[:, :, 0] *= scale_x
         tracks_np[:, :, 1] *= scale_y
-        
-        visibility_np = visibility[0].cpu().numpy()
-        breathing_metric = self.calculate_breathing_artifact(tracks_np)
-        
+        vis_np = visibility[0].cpu().numpy()  # (T, N_total)
+
+        fg_tracks = tracks_np[:, :n_fg_pts, :]
+        bg_tracks = tracks_np[:, n_fg_pts:, :]
+        fg_vis    = vis_np[:, :n_fg_pts]
+        bg_vis    = vis_np[:, n_fg_pts:]
+
+        breathing_metric = self.calculate_breathing_artifact(fg_tracks)
+
         del video_tensor
         torch.cuda.empty_cache()
-        
+
         return PerceptionResult(
             video_id=os.path.basename(video_path),
-            frames_count=len(tracks_np),
-            masks=np.zeros((1, 1, 1)), 
-            h_pixel=np.zeros(len(tracks_np)),
-            x_center=np.zeros(len(tracks_np)),
-            tracks_2d=tracks_np,
-            confidence=visibility_np,
-            metadata={"breathing_metric": breathing_metric}
+            frames_count=len(fg_tracks),
+            masks=np.zeros((1, 1, 1)),
+            h_pixel=np.zeros(len(fg_tracks)),
+            x_center=np.zeros(len(fg_tracks)),
+            tracks_2d=fg_tracks,
+            confidence=fg_vis,
+            metadata={
+                "breathing_metric": breathing_metric,
+                "bg_tracks": bg_tracks,      # (T, N_bg, 2) — 背景轨迹
+                "bg_visibility": bg_vis,     # (T, N_bg)
+            },
         )
 
     def calculate_breathing_artifact(self, tracks: np.ndarray) -> float:

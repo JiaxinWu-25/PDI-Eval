@@ -5,6 +5,7 @@ checkpoints/
 *.pth
 *.pt
 
+data/
 # 2. 数据与结果
 output/
 debug_results/
@@ -21,4 +22,4 @@ __pycache__/
 .cursor/
 .DS_Store
 .venv/
-env/
+env/data/1s.mp4
