@@ -24,6 +24,9 @@ class PDILogger:
     def success(self, msg: str):
         self.log.info(f"[bold green]✔ {msg}[/bold green]")
 
+    def warning(self, msg: str):
+        self.log.warning(f"[yellow]{msg}[/yellow]")
+
     def error(self, msg: str):
         self.log.error(f"[bold red]✘ {msg}[/bold red]")
 

@@ -15,6 +15,20 @@ results/
 *.png
 *.npz
 *.npy
+DAVIS/
+hunyuan/
+cogvideoX/
+test_lietorch.py
+test.py
+testing.py
+cotracker_check.py
+sam2_check.py
+debug_results/
+debug_sam2.py
+paper.tex
+allpdi/
+pdi_recalculate.py
+plot_pdi.py
 
 # 3. 系统与环境
 __pycache__/
@@ -24,5 +38,5 @@ __pycache__/
 .venv/
 env/data/1s.mp4
 data/1s.mp4
-data/1s.mp4
-data/1s.mp4
+
+

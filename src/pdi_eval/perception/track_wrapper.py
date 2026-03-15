@@ -88,30 +88,11 @@ class TrackWrapper(BasePerceptor):
         )
         small_mask = (small_mask > 0).astype(np.uint8)
 
-        # --- 2. 前景 queries ---
-        yy_fg, xx_fg = np.where(small_mask > 0)
-        if len(yy_fg) == 0:
-            pdi_logger.warning("初始 mask 无前景像素，仅使用背景网格追踪")
-            fg_queries_np = np.empty((0, 3), dtype=np.float32)
-        else:
-            n_fg = min(grid_size * grid_size, len(yy_fg))
-            idx_fg = np.linspace(0, len(yy_fg) - 1, n_fg, dtype=int)
-            fg_queries_np = np.stack(
-                [np.zeros(n_fg), xx_fg[idx_fg].astype(np.float32), yy_fg[idx_fg].astype(np.float32)],
-                axis=1,
-            )
+        # --- 2. 前景 queries（空间均匀网格采样）---
+        fg_queries_np = self._grid_sample_queries(small_mask, region=1, n=grid_size * grid_size)
 
         # --- 3. 背景 queries ---
-        yy_bg, xx_bg = np.where(small_mask == 0)
-        if len(yy_bg) > 0:
-            n_bg = min(bg_grid_size * bg_grid_size, len(yy_bg))
-            idx_bg = np.linspace(0, len(yy_bg) - 1, n_bg, dtype=int)
-            bg_queries_np = np.stack(
-                [np.zeros(n_bg), xx_bg[idx_bg].astype(np.float32), yy_bg[idx_bg].astype(np.float32)],
-                axis=1,
-            )
-        else:
-            bg_queries_np = np.empty((0, 3), dtype=np.float32)
+        bg_queries_np = self._grid_sample_queries(small_mask, region=0, n=bg_grid_size * bg_grid_size)
 
         # --- 4. 合并 queries 送入推理 ---
         n_fg_pts = len(fg_queries_np)
@@ -154,10 +135,18 @@ class TrackWrapper(BasePerceptor):
         fg_vis    = vis_np[:, :n_fg_pts]
         bg_vis    = vis_np[:, n_fg_pts:]
 
+        # --- 6. 追踪质量过滤 ---
+        fg_tracks, fg_vis = self._filter_tracks(fg_tracks, fg_vis)
+        bg_tracks, bg_vis = self._filter_tracks(bg_tracks, bg_vis)
+
         breathing_metric = self.calculate_breathing_artifact(fg_tracks)
 
         del video_tensor
         torch.cuda.empty_cache()
+
+        n_fg_kept = fg_tracks.shape[1]
+        tracking_confidence = float(fg_vis.mean()) if fg_vis.size > 0 else 0.0
+        pdi_logger.info(f"追踪完成: 前景保留 {n_fg_kept} 点, 平均可见度 {tracking_confidence:.3f}")
 
         return PerceptionResult(
             video_id=os.path.basename(video_path),
@@ -169,10 +158,102 @@ class TrackWrapper(BasePerceptor):
             confidence=fg_vis,
             metadata={
                 "breathing_metric": breathing_metric,
-                "bg_tracks": bg_tracks,      # (T, N_bg, 2) — 背景轨迹
-                "bg_visibility": bg_vis,     # (T, N_bg)
+                "tracking_confidence": tracking_confidence,
+                "bg_tracks": bg_tracks,
+                "bg_visibility": bg_vis,
             },
         )
+
+    def _grid_sample_queries(
+        self,
+        mask: np.ndarray,
+        region: int,
+        n: int,
+    ) -> np.ndarray:
+        """在 mask 指定区域（region=1 前景 / region=0 背景）做空间均匀网格采样。
+
+        将区域划分为 sqrt(n) x sqrt(n) 的子格，每格随机取一点，避免点簇聚。
+        返回 (M, 3) 的 queries，格式为 [frame=0, x, y]，M <= n。
+        """
+        yy, xx = np.where(mask == region)
+        if len(yy) == 0:
+            if region == 1:
+                pdi_logger.warning("初始 mask 无前景像素，仅使用背景网格追踪")
+            return np.empty((0, 3), dtype=np.float32)
+
+        n = min(n, len(yy))
+        side = max(1, int(np.ceil(np.sqrt(n))))
+        h, w = mask.shape
+        cell_h = max(1, h // side)
+        cell_w = max(1, w // side)
+
+        rng = np.random.default_rng(42)
+        pts = []
+        for gy in range(side):
+            for gx in range(side):
+                y0, y1 = gy * cell_h, min((gy + 1) * cell_h, h)
+                x0, x1 = gx * cell_w, min((gx + 1) * cell_w, w)
+                in_cell = np.where((yy >= y0) & (yy < y1) & (xx >= x0) & (xx < x1))[0]
+                if len(in_cell) > 0:
+                    pick = rng.choice(in_cell)
+                    pts.append([0.0, float(xx[pick]), float(yy[pick])])
+                if len(pts) >= n:
+                    break
+            if len(pts) >= n:
+                break
+
+        if not pts:
+            # fallback: 随机采样
+            idx = rng.choice(len(yy), min(n, len(yy)), replace=False)
+            pts = [[0.0, float(xx[i]), float(yy[i])] for i in idx]
+
+        return np.array(pts, dtype=np.float32)
+
+    def _filter_tracks(
+        self,
+        tracks: np.ndarray,
+        vis: np.ndarray,
+        min_vis_ratio: float = 0.3,
+        max_jump_px: float = 120.0,
+    ) -> tuple:
+        """过滤低质量追踪轨迹。
+
+        Args:
+            tracks:        (T, N, 2)
+            vis:           (T, N) bool/float，Co-Tracker 可见性
+            min_vis_ratio: 至少此比例帧可见才保留该点
+            max_jump_px:   单帧最大允许位移（像素），超过则认为发生跳变
+
+        Returns:
+            filtered_tracks (T, M, 2), filtered_vis (T, M)
+        """
+        T, N, _ = tracks.shape
+        if N == 0:
+            return tracks, vis
+
+        # 1. 可见性过滤
+        vis_ratio = vis.mean(axis=0)           # (N,)
+        vis_ok = vis_ratio >= min_vis_ratio
+
+        # 2. 跳变过滤：任意相邻帧位移超阈值则丢弃
+        if T > 1:
+            delta = np.linalg.norm(np.diff(tracks, axis=0), axis=2)   # (T-1, N)
+            jump_ok = delta.max(axis=0) < max_jump_px
+        else:
+            jump_ok = np.ones(N, dtype=bool)
+
+        keep = vis_ok & jump_ok
+        n_removed = int((~keep).sum())
+        if n_removed > 0:
+            pdi_logger.info(f"追踪过滤: 丢弃 {n_removed}/{N} 个低质量点 "
+                            f"(可见性不足:{int((~vis_ok).sum())} 跳变:{int((~jump_ok).sum())})")
+
+        # 至少保留 2 个点；全部不可信时 fallback 保留全部并警告
+        if keep.sum() < 2:
+            pdi_logger.warning(f"追踪质量极低：所有 {N} 个点均不可信，保留全部以防崩溃")
+            keep = np.ones(N, dtype=bool)
+
+        return tracks[:, keep, :], vis[:, keep]
 
     def calculate_breathing_artifact(self, tracks: np.ndarray) -> float:
         """

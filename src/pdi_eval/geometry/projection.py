@@ -230,7 +230,9 @@ class ProjectionJudge:
             (global_vp, fg_vp, bg_vp): 三个 (x, y) 元组
         """
         # --- 路径一：前景轨迹线 ---
-        fg_lines = self._lines_from_tracks(fg_tracks, min_motion_px, bottom_ratio=0.4)
+        # 短向量在 RANSAC 中噪声占主导，提高前景最小运动阈值到 10px
+        fg_min_motion = max(min_motion_px, 10.0)
+        fg_lines = self._lines_from_tracks(fg_tracks, fg_min_motion, bottom_ratio=0.4)
         fg_vp = self._ransac_vp(fg_lines, ransac_thresh, ransac_iters)
 
         # --- 路径二：背景轨迹线 + LSD 几何线 ---
@@ -241,10 +243,18 @@ class ProjectionJudge:
             if len(bg_motion_lines) > 0:
                 bg_line_parts.append(bg_motion_lines)
 
+        # 多帧 LSD：对前 3 帧分别检测，合并后重复 3 次以提升权重
         if frames is not None and masks is not None:
-            lsd_lines = self._lines_from_lsd(frames[0], masks[0])
-            if len(lsd_lines) > 0:
-                bg_line_parts.append(lsd_lines)
+            lsd_all = []
+            n_lsd_frames = min(len(frames), len(masks), 3)
+            for i in range(n_lsd_frames):
+                lsd_f = self._lines_from_lsd(frames[i], masks[i])
+                if len(lsd_f) > 0:
+                    lsd_all.append(lsd_f)
+            if lsd_all:
+                lsd_combined = np.concatenate(lsd_all, axis=0)
+                # 重复 3 次：在 RANSAC 投票中给背景几何线更高的 inlier 票数
+                bg_line_parts.append(np.tile(lsd_combined, (3, 1)))
 
         if bg_line_parts:
             bg_lines_all = np.concatenate(bg_line_parts, axis=0)
@@ -260,6 +270,56 @@ class ProjectionJudge:
             global_vp = (self.cx, self.cy)
 
         return global_vp, fg_vp, bg_vp
+
+    def classify_fg_motion(
+        self,
+        fg_tracks: np.ndarray,
+        min_motion_px: float = 5.0,
+        parallel_angle_std_thresh: float = 15.0,
+        horizontal_ratio_thresh: float = 2.5,
+    ) -> str:
+        """分类前景物体的运动模式。
+
+        Args:
+            fg_tracks:                (N, T, 2) 前景轨迹
+            min_motion_px:            过滤过短运动的阈值
+            parallel_angle_std_thresh: 运动方向角度标准差小于此值（度）时判为平行运动
+            horizontal_ratio_thresh:  |mean_dx| / |mean_dy| 超过此值时判为横向运动
+
+        Returns:
+            "transverse" : 横向/平行平移（H-VP 公式退化）
+            "depth"      : 深度方向运动（H-VP 公式有效）
+        """
+        N, T, _ = fg_tracks.shape
+        if T < 2 or N < 2:
+            return "depth"
+
+        n_avg = max(1, T // 10)
+        p_start = fg_tracks[:, :n_avg, :].mean(axis=1)
+        p_end   = fg_tracks[:, -n_avg:, :].mean(axis=1)
+        disp    = p_end - p_start                              # (N, 2)
+        lengths = np.linalg.norm(disp, axis=1)
+        valid   = lengths >= min_motion_px
+        if valid.sum() < 3:
+            return "depth"
+
+        angles = np.degrees(np.arctan2(disp[valid, 1], disp[valid, 0]))  # [-180, 180]
+        # 将角度折叠到 [0, 180) 消除方向符号影响
+        angles = angles % 180.0
+        angle_std = float(np.std(angles))
+
+        mean_dx = float(np.mean(np.abs(disp[valid, 0])))
+        mean_dy = float(np.mean(np.abs(disp[valid, 1]))) + 1e-6
+
+        # 两个条件必须同时满足才判为横向平移：
+        # 1. 矢量方向高度集中（近似平行，角度标准差小）
+        # 2. 主运动方向明显水平（|dx| >> |dy|）
+        # 单独满足任一条件可能只是前向运动带轻微侧漂，不应误判
+        is_parallel   = angle_std < parallel_angle_std_thresh
+        is_horizontal = (mean_dx / mean_dy) > horizontal_ratio_thresh
+        if is_parallel and is_horizontal:
+            return "transverse"
+        return "depth"
 
     def compute_universal_trajectory_epsilon(
         self,

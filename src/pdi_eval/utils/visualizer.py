@@ -119,6 +119,9 @@ class EvidenceVisualizer:
         mask = (masks[i] > 0).astype(np.uint8)
         if video_frames is not None and i < len(video_frames):
             overlay = video_frames[i].copy()
+            fh, fw = overlay.shape[:2]
+            if mask.shape != (fh, fw):
+                mask = cv2.resize(mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
             overlay[mask == 1] = (overlay[mask == 1] * 0.4 + np.array([0, 255, 0]) * 0.6).clip(0, 255).astype(np.uint8)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2)

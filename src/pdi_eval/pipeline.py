@@ -1,3 +1,4 @@
+import gc
 import torch
 import numpy as np
 import cv2
@@ -13,6 +14,7 @@ from .geometry.projection import ProjectionJudge
 from .evaluator.motion_audit import audit_trajectory_consistency
 from .evaluator.scale_audit import audit_scale_consistency
 from .evaluator.volume_audit import audit_3d_volume_stability
+from .evaluator.reconstruction_audit import audit_reconstruction
 from .metrics.pdi_index import PDIIndexCalculator
 from .data.cache_manager import CacheManager
 from .utils.logger import pdi_logger
@@ -21,14 +23,15 @@ from .utils.visualizer import EvidenceVisualizer
 class PDIEvaluationPipeline:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.cache = CacheManager()
+        self.cache = CacheManager(cache_dir=config.get("cache_dir", "output/cache/"))
         self.video_id = ""
         self.video_path = ""
         self.last_report = None
         self.last_res_tracks = None
         self.last_masks = None
+        self.last_pointmaps = None
 
-    def run(self, video_path: str, click_points: Optional[list] = None, text_query: Optional[str] = None) -> Dict[str, Any]:
+    def run(self, video_path: str, click_points: Optional[list] = None, text_query: Optional[str] = None, render_output_dir: Optional[str] = None) -> Dict[str, Any]:
         self.video_path = video_path
         self.video_id = Path(video_path).stem
         pdi_logger.info(f"--- [bold blue]PDI-Eval Pipeline Start: {self.video_id}[/bold blue] ---")
@@ -47,7 +50,8 @@ class PDIEvaluationPipeline:
                 "is_truncated": res_2d_raw.is_truncated
             })
             res_2d = self.cache.load_step(self.video_id, "sam2")
-            del sam
+            del res_2d_raw, sam
+            gc.collect()
             torch.cuda.empty_cache()
 
         # 1.5 Co-Tracker (前景+背景一次性追踪)
@@ -64,7 +68,8 @@ class PDIEvaluationPipeline:
                 "bg_visibility": res_tracks_raw.metadata.get("bg_visibility", np.empty((0, 0))),
             })
             res_tracks = self.cache.load_step(self.video_id, "cotracker")
-            del tracker
+            del res_tracks_raw, tracker
+            gc.collect()
             torch.cuda.empty_cache()
 
         # 2. 3D Engine Selection
@@ -83,7 +88,8 @@ class PDIEvaluationPipeline:
                 "pointmaps": res_3d_raw.pointmaps
             })
             res_3d = self.cache.load_step(self.video_id, engine_type)
-            del perceptor
+            del res_3d_raw, perceptor
+            gc.collect()
             torch.cuda.empty_cache()
 
         # 3. Geometry Alignment
@@ -131,17 +137,42 @@ class PDIEvaluationPipeline:
             frames=lsd_frames,
             masks=res_2d['masks'][:len(lsd_frames)] if lsd_frames is not None else None,
         )
-        # 轨迹审计使用 fg_vp（内源运动学解耦）；若前景运动不足导致 fg_vp 退化为主点，fallback 到 bg_vp
-        vp = fg_vp if fg_vp != (cam.cx, cam.cy) else bg_vp
+        # 轨迹审计 VP 选择：优先 fg_vp，但若 fg_vp 退化或落在物体内部则 fallback 到 bg_vp
+        def _vp_in_object_bbox(vp_xy, masks, margin_ratio=0.1):
+            """检查消失点是否落在前景物体的包围盒内（含 margin），若是则说明 VP 退化"""
+            if masks is None or len(masks) == 0:
+                return False
+            combined = np.any(masks[:min(5, len(masks))], axis=0)
+            ys, xs = np.where(combined)
+            if len(xs) == 0:
+                return False
+            x_min, x_max = int(xs.min()), int(xs.max())
+            y_min, y_max = int(ys.min()), int(ys.max())
+            mx = (x_max - x_min) * margin_ratio
+            my = (y_max - y_min) * margin_ratio
+            return (x_min - mx <= vp_xy[0] <= x_max + mx and
+                    y_min - my <= vp_xy[1] <= y_max + my)
+
+        fg_degenerate = (fg_vp == (cam.cx, cam.cy))
+        fg_in_bbox = _vp_in_object_bbox(fg_vp, masks_use)
+        if fg_degenerate or fg_in_bbox:
+            vp = bg_vp
+            reason = "落在物体包围盒内" if fg_in_bbox else "退化为主点"
+            pdi_logger.info(f"fg_vp {reason}，fallback 使用 bg_vp ({bg_vp[0]:.1f},{bg_vp[1]:.1f})")
+        else:
+            vp = fg_vp
 
         # VP 方向一致性残差：检测 fg_vp 与 bg_vp 是否指向同一方向
         # 用余弦角度差代替欧式距离，对横向运动鲁棒（横向运动时两个 VP 都指向同侧极远处）
+        img_h, img_w = res_2d['masks'].shape[1], res_2d['masks'].shape[2]
         fg_dir = np.array([fg_vp[0] - cam.cx, fg_vp[1] - cam.cy], dtype=np.float64)
         bg_dir = np.array([bg_vp[0] - cam.cx, bg_vp[1] - cam.cy], dtype=np.float64)
         fg_norm = float(np.linalg.norm(fg_dir))
         bg_norm = float(np.linalg.norm(bg_dir))
-        if fg_norm < 5.0 or bg_norm < 5.0:
-            # 任一 VP 退化（基本落在主点），本项无效
+        # fg_vp 飞出画面之外时为浅角运动退化，方向比较无意义
+        fg_offscreen = (fg_vp[0] < 0 or fg_vp[0] > img_w or
+                        fg_vp[1] < 0 or fg_vp[1] > img_h)
+        if fg_norm < 5.0 or bg_norm < 5.0 or fg_offscreen:
             eps_vp = 0.0
         else:
             cos_sim = float(np.dot(fg_dir, bg_dir)) / (fg_norm * bg_norm)
@@ -160,6 +191,7 @@ class PDIEvaluationPipeline:
         # 4.2 广义轨迹审计 (VP-Driven 取代中心点假设)
         # 使用 Co-Tracker 所有点的均值质心 (T, 2)
         stable_xy_seq = np.mean(tracks_use, axis=1)   # (T_use, 2)
+
         eps_traj_seq = audit_trajectory_consistency(h_pixel_use, stable_xy_seq, vp)
 
         # 旋转自适应修正：2D VP 模型仅对质心平移有效。
@@ -205,10 +237,57 @@ class PDIEvaluationPipeline:
         final_report['vanishing_point'] = global_vp
         final_report['fg_vp'] = fg_vp
         final_report['bg_vp'] = bg_vp
-        
+
+        # 6. Reconstruction Audit（可选，由 config.reconstruction_audit.enabled 控制）
+        ra_cfg = self.config.get('reconstruction_audit', {})
+        # pointmaps 全零说明 mega_sam 走了 fallback，3D 重建无效，跳过审计
+        _pm_valid = (pointmaps_use is not None and np.any(pointmaps_use != 0))
+        if ra_cfg.get('enabled', False) and _pm_valid:
+            pdi_logger.info("Running Reconstruction Audit...")
+            # pointmaps Z 分量作为 (T, H, W) 深度图，供数学层使用
+            depth_z_3d = pointmaps_use[:, :, :, 2]
+
+            mllm_cfg = ra_cfg.get('mllm', {})
+            mllm_config_for_audit = None
+            frames_for_audit = None
+            save_render_path = None
+
+            if mllm_cfg.get('enabled', False) and mllm_cfg.get('api_key'):
+                mllm_config_for_audit = mllm_cfg
+                # 用 ffmpeg pipe 读帧，绕过 GStreamer 编解码限制
+                from .evaluator.reconstruction_audit import _load_video_frames_ffmpeg
+                # max_frames 必须 >= T_use，否则索引越界导致全部走渐变兜底
+                frames_for_audit = _load_video_frames_ffmpeg(
+                    video_path, max_frames=pointmaps_use.shape[0]
+                )
+                pdi_logger.info(f"读取视频帧 {len(frames_for_audit)} 帧用于点云着色")
+                # 渲染图保存目录：优先使用外部传入的 render_output_dir
+                _render_dir = Path(render_output_dir) if render_output_dir else (Path.cwd() / "results" / self.video_id)
+                _render_dir.mkdir(parents=True, exist_ok=True)
+                save_render_path = str(_render_dir / f"{self.video_id}_recon_render.jpg")
+
+            ra_result = audit_reconstruction(
+                pointmaps=pointmaps_use,
+                depth_z=depth_z_3d,
+                masks=masks_use,
+                residuals=None,
+                mllm_config=mllm_config_for_audit,
+                frames=frames_for_audit,
+                save_render_path=save_render_path,
+            )
+            pdi_logger.info(
+                f"Reconstruction Audit: math_pass={ra_result['math']['math_pass']}  "
+                f"overall_pass={ra_result['overall_pass']}"
+            )
+        else:
+            ra_result = None
+
+        final_report['reconstruction_audit'] = ra_result
+
         self.last_report = final_report
         self.last_res_tracks = {**res_tracks, "tracks": tracks_use}
         self.last_masks = masks_use
+        self.last_pointmaps = pointmaps_use
         
         pdi_logger.pdi_report(final_report)
         return final_report

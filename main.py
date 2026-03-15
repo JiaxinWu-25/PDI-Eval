@@ -70,24 +70,24 @@ def main():
     )
     
 
-    # B. 保存标注视频到 results/{video_stem}/
-    annotated_path = pipeline.get_annotated_video(output_dir=str(output_path))
+    # B. 保存标注视频到 results/{video_stem}/（已禁用）
+    # annotated_path = pipeline.get_annotated_video(output_dir=str(output_path))
 
-    # C. 保存 SAM2 mask 叠加图（逐帧 PNG）
-    if pipeline.last_masks is not None:
-        import cv2 as _cv2
-        _cap = _cv2.VideoCapture(args.input)
-        raw_frames = []
-        while True:
-            ret, f = _cap.read()
-            if not ret:
-                break
-            raw_frames.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
-        _cap.release()
-        import numpy as _np
-        raw_frames_arr = _np.array(raw_frames) if raw_frames else None
-        mask_path = viz.save_mask_sample(pipeline.last_masks, raw_frames_arr, video_stem)
-        pdi_logger.info(f"SAM2 mask sample saved to: {mask_path}")
+    # C. 保存 SAM2 mask 叠加图（已禁用）
+    # if pipeline.last_masks is not None:
+    #     import cv2 as _cv2
+    #     _cap = _cv2.VideoCapture(args.input)
+    #     raw_frames = []
+    #     while True:
+    #         ret, f = _cap.read()
+    #         if not ret:
+    #             break
+    #         raw_frames.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
+    #     _cap.release()
+    #     import numpy as _np
+    #     raw_frames_arr = _np.array(raw_frames) if raw_frames else None
+    #     mask_path = viz.save_mask_sample(pipeline.last_masks, raw_frames_arr, video_stem)
+    #     pdi_logger.info(f"SAM2 mask sample saved to: {mask_path}")
 
     # --- 新增：保存文本报告 ---
     report_txt_path = output_path / f"{video_stem}_pdi_report.txt"
@@ -107,11 +107,27 @@ def main():
         f.write(f" - Trajectory Component (H-X):   {report['breakdown'].get('traj_component', 0):.4f}\n")
         f.write(f" - Rigidity Component (Stability): {report['breakdown'].get('rigidity_component', 0):.4f}\n")
         f.write(f" - VP Component (View Consistency): {report['breakdown'].get('vp_component', 0):.4f}\n")
+        ra = report.get("reconstruction_audit")
+        if ra is not None:
+            f.write("-" * 50 + "\n")
+            f.write("RECONSTRUCTION AUDIT:\n")
+            math = ra.get("math", {})
+            f.write(f" - RA Math Pass:    {math.get('math_pass')}\n")
+            f.write(f" - RA Ground RMSE:  {math.get('ground_rmse')}\n")
+            f.write(f" - RA Scale Jump:   {math.get('scale_jump')}\n")
+            f.write(f" - RA Reproj Err:   {math.get('reprojection_residual')}\n")
+            mllm = ra.get("mllm")
+            if mllm is not None:
+                f.write(f" - RA MLLM Success: {mllm.get('reconstruction_success')}\n")
+                f.write(f" - RA MLLM Score:   {mllm.get('score')}\n")
+                if mllm.get("reason"):
+                    f.write(f" - RA MLLM Reason:  {mllm.get('reason')}\n")
+            f.write(f" - RA Overall Pass: {ra.get('overall_pass')}\n")
         f.write("-" * 50 + "\n")
         f.write(f"Results generated at: {output_path}\n")
         f.write("="*50 + "\n")
 
-    pdi_logger.info(f"✅ 审计完成！最终 PDI 分数: {report['pdi_score']:.4f} [{report['grade']}]")
+    pdi_logger.info(f"审计完成！最终 PDI 分数: {report['pdi_score']:.4f} [{report['grade']}]")
     pdi_logger.info(f"📄 文本报告已生成: {report_txt_path}")
     pdi_logger.info(f"📁 详细结果与物证已存至: {output_path}")
 
